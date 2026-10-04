@@ -141,3 +141,4 @@ Columns follow the course's example log book template (everyone should also keep
 |  | Rosie |  |  |  |  |  |  |
 |  | Will |  |  |  |  |  |  |
 |  | Ares | Python coding |  |  |  |  |  |
+|  | Joe | 
