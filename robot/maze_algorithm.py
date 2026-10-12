@@ -6,7 +6,7 @@ import time
 # 1 = uncreachable cell e.g wall
 # 2 = ending cell
 # 3 = visited cell 
-
+# NOT WRITTEN BY AI
 #initialising the maze as a list of nested arrays where 0 is an empy cell and 1 is a wall
 
 maze = [
@@ -40,3 +40,4 @@ def search(x,y):
     return False 
 
 search(0,0)
+
