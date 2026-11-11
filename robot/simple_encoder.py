@@ -1,10 +1,16 @@
-# Prints the LEFT encoder count. No motor power: turn the wheel by hand.
-# For the right encoder use ENC_A=8, ENC_B=9.
+# Prints one encoder's count. No motor power: turn the wheel by hand.
+# Change MOTOR to "left" or "right".
 from machine import Pin
 import time
 
-ENC_A = 6
-ENC_B = 7
+MOTOR = "right"
+
+# GP numbers (not physical pin numbers): encoder A, encoder B
+PINS = {
+    "left":  (6, 7),   # physical pins 9, 10
+    "right": (8, 9),   # physical pins 11, 12
+}
+ENC_A, ENC_B = PINS[MOTOR]
 
 ticks = 0
 enc_a = Pin(ENC_A, Pin.IN, Pin.PULL_UP)
@@ -19,6 +25,8 @@ def on_edge(pin):
 
 enc_a.irq(trigger=Pin.IRQ_RISING | Pin.IRQ_FALLING, handler=on_edge)
 
+print("Turn the", MOTOR, "wheel by hand. Press Stop to finish and ,make changes.")
 while True:
     print("ticks:", ticks, " A:", enc_a.value(), " B:", enc_b.value())
     time.sleep_ms(200)
+
