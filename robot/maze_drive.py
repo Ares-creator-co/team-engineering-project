@@ -56,9 +56,10 @@ MAX_SECONDS = 60       # stop after this long
 FOLLOW_SIDE = "right"  # "right" = right-hand rule, "left" = left-hand rule
 TAKE_SIDE_OPENINGS = True
 TICKS_PER_MM = 2.5     # calibrated 18 Nov: 2507 ticks was about 1 m
-OPEN_TO_CENTRE_MM = 240  # from seeing the opening to the middle of that cell. The side sensors
-                         # look ~110 mm ahead and sit ~57 mm in front of the wheels, so it sees the
-                         # opening ~165 mm early, + ~84 mm to the middle. Turns too early: raise it
+OPEN_TO_CENTRE_MM = 170  # from spotting the opening to the middle of it. Was 240 (turned too late).
+                         # 18 Nov log: it spots the gap about when the sensor is level with the
+                         # middle of it, and the sensor looks ~110 mm ahead + sits ~57 mm in front
+                         # of the wheels, so ~170 mm. Turns too early: raise it. Too late: lower it
 TURN_90_TICKS = 140    # ticks for a 90 deg turn (the 180s took ~285). Turns too far: lower it
 OPEN_COUNT = 3         # readings in a row that must say "open" before we believe it
 STUCK_MS = 500         # if the wheels hardly move for this long while driving, treat it as a wall
