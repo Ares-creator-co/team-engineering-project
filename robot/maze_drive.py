@@ -72,7 +72,11 @@ STUCK_MS = 500         # if the wheels hardly move for this long while driving, 
 REVERSE_LEFT = True    # flip if the left wheel turns the wrong way
 REVERSE_RIGHT = True   # flip if the right wheel turns the wrong way
 LINE_UP = False        # False: just drive off straight as placed (the line-up turned left and hit walls)
-TOO_CLOSE_MM = 55      # side reading under this (centred is ~125) = nearly touching, steer away hard
+TOO_CLOSE_MM = 65      # side reading under this (centred is ~125) = too close, steer away hard (was 55)
+AFTER_TURN_MM = 100    # drive slower for this far after every turn so the steering can centre it
+AFTER_TURN_SPEED = 0.6 # ... at this fraction of TARGET_SPEED
+IGNORE_AFTER_TURN_MM = 60  # after a turn the side sensors still see the corridor we just left,
+                           # so don't count side readings for deciding the next turn until here
 TOO_CLOSE_STEER = 0.3  # how hard it steers away when too close
 SELF_CHECK = False     # True: nudge left and back at the start to check the steering direction
                        # (it passed every run on 16 Nov, so it's off: the nudge knocked it crooked)
@@ -407,6 +411,7 @@ def drive():
     # the wall they only see the front wall, so we remember what they saw on the way in.
     open_left = open_right = None
     open_l_count = open_r_count = seen_ahead = 0
+    last_turn_ticks = (left_wheel.ticks + right_wheel.ticks) // 2
     # side openings: only count an opening after we've seen a left wall (wall -> gap), and
     # remember the tick count where we should turn
     seen_left_wall = False
@@ -420,18 +425,19 @@ def drive():
 
     while time.ticks_diff(time.ticks_ms(), start) < MAX_SECONDS * 1000:
         f, l, r = distance("front"), distance("left"), distance("right")
+        since_turn = ((left_wheel.ticks + right_wheel.ticks) // 2 - last_turn_ticks) / TICKS_PER_MM
         closest_side = min(closest_side, l, r)
         # which sides are open at the end of this corridor? Count "open" readings on the way in.
         # Don't just use the last reading: right at the end the angled sensor can hit the wall
         # ahead where it carries on past the gap (zigzags) and read "wall" when it's open
-        if SIDES_BLIND_MM <= f <= 280:
+        if since_turn >= IGNORE_AFTER_TURN_MM and TURN_AT_MM <= f <= 280:
             seen_ahead += 1
             if l > centred * WALL_FACTOR:
                 open_l_count += 1
             if r > centred * WALL_FACTOR:
                 open_r_count += 1
-            open_left = open_l_count >= 2
-            open_right = open_r_count >= 2
+            open_left = open_l_count >= 3
+            open_right = open_r_count >= 3
 
         # wall ahead: turn and carry on (2 close readings in a row, so one odd reading can't do it)
         close_count = close_count + 1 if wall_ahead_turn(f, l, r) else 0
@@ -466,6 +472,7 @@ def drive():
             close_count = 0
             open_left = open_right = None
             open_l_count = open_r_count = seen_ahead = 0
+            last_turn_ticks = (left_wheel.ticks + right_wheel.ticks) // 2
             last_mode, last_err, smooth_err, rate = None, None, None, 0
             left_speed.reset()
             right_speed.reset()
@@ -532,6 +539,7 @@ def drive():
             close_count = 0
             open_left = open_right = None
             open_l_count = open_r_count = seen_ahead = 0
+            last_turn_ticks = (left_wheel.ticks + right_wheel.ticks) // 2
             last_mode, last_err, smooth_err, rate = None, None, None, 0
             left_speed.reset()
             right_speed.reset()
@@ -585,8 +593,11 @@ def drive():
             modes[mode] = modes.get(mode, 0) + 1
         steer = max(-MAX_STEER, min(MAX_STEER, steer))
         # steer by asking for different wheel speeds; each wheel's speed control finds the power
-        left_speed.drive(TARGET_SPEED * (1 - steer))
-        right_speed.drive(TARGET_SPEED * (1 + steer))
+        speed = TARGET_SPEED
+        if since_turn < AFTER_TURN_MM:
+            speed = TARGET_SPEED * AFTER_TURN_SPEED   # slow just after a turn
+        left_speed.drive(speed * (1 - steer))
+        right_speed.drive(speed * (1 + steer))
 
         if time.ticks_diff(now, last_save) >= 2000:   # save every 2 s so we always get a log
             last_save = now
