@@ -60,7 +60,9 @@ TICKS_PER_MM = 2.5     # calibrated 18 Nov: 2507 ticks was about 1 m
 # to "wall" (the far corner). Halfway between = middle of the gap, as seen by the sensor.
 # The sensor looks ~110 mm ahead and sits ~57 mm in front of the wheels, so the wheels reach
 # the middle of the gap LOOK_AHEAD_MM after that. Turns too early: raise it. Too late: lower it
-LOOK_AHEAD_MM = 165
+LOOK_AHEAD_MM = 120    # was 165: turned ~40-50 mm too late (18 Nov logs)
+GAP_MIN_MM = 40        # ignore 'gaps' shorter than this (real ones measure ~85 mm, the sensor
+                       # sees the far corner early so gaps look shorter than 168)
 GAP_MAX_MM = 220       # gap still open after this far = no far wall (open area): turn at
                        # gap start + LOOK_AHEAD_MM + 84 instead
 SETTLE_MS = 200        # stop and settle this long before turning in
@@ -478,6 +480,11 @@ def drive():
                 seen_left_wall = True
                 left_gap_count = 0
                 wall_count += 1
+                if gap_start is not None and wall_count >= OPEN_COUNT and \
+                        moved - gap_start < GAP_MIN_MM * TICKS_PER_MM:
+                    trace.append("ignored a %d mm gap (too short to be real)" % (
+                        (moved - gap_start) / TICKS_PER_MM))
+                    gap_start = None
                 if gap_start is not None and wall_count >= OPEN_COUNT:
                     # far corner of the gap: the middle is halfway between start and here
                     middle = (gap_start + moved) // 2
