@@ -27,7 +27,7 @@ TARGET_SPEED = 400     # encoder ticks per second for each wheel. Lower = slower
 # Power each wheel starts at. The left motor needs far more than the right (wheel test 16 Nov:
 # at 0.3 the left barely moved, right did 1300 ticks/s). The speed control corrects these as
 # it drives; good starting values just stop it curving in the first second.
-START_POWER_LEFT = 0.62   # 18 Nov: left needed 0.60-0.68 in the last runs (left motor keeps getting weaker)
+START_POWER_LEFT = 0.55   # 18 Nov maze_drive runs: left needed 0.49-0.61 (left motor keeps getting weaker)
 START_POWER_RIGHT = 0.22  # and the right ~0.20-0.26
 SPEED_GAIN = 0.00008   # power change every 50 ms per tick/s a wheel is off. Speed hunts: lower it
 # Side sensors point 30 deg out from straight ahead (a V), ~23 mm either side of the front sensor.
@@ -62,14 +62,10 @@ TICKS_PER_MM = 2.5     # calibrated 18 Nov: 2507 ticks was about 1 m
 # The sensor looks ~110 mm ahead and sits ~57 mm in front of the wheels, so the wheels reach
 # the middle of the gap LOOK_AHEAD_MM after that. Turns too early: raise it. Too late: lower it
 LOOK_AHEAD_MM = 120    # was 165: turned ~40-50 mm too late (18 Nov logs)
-GAP_SEEN_MM = 85       # how long a one-cell gap looks to the side sensor (measured 57-92)
 GAP_MIN_MM = 40        # ignore 'gaps' shorter than this (real ones measure ~85 mm, the sensor
                        # sees the far corner early so gaps look shorter than 168)
 GAP_MAX_MM = 220       # gap still open after this far = no far wall (open area): turn at
                        # gap start + LOOK_AHEAD_MM + 84 instead
-CELL_MM = 180          # one maze cell
-TURN_90_REAL = 141     # ticks a real 90 deg turn ends up at (half of the ~282 the 180s take)
-USE_MEMORY = True      # remember visited cells and don't go back down ones we've done
 SETTLE_MS = 200        # stop and settle this long before turning in
 TURN_90_TICKS = 130    # it coasts ~12 ticks after stopping, so this ends up ~142 = 90 deg
                        # (was 140, which ended at 151-153 = ~97 deg). Turns too far: lower it
@@ -289,7 +285,9 @@ def wall_ahead_turn(f, l, r):
 
 def off_centre(f, l, r, centred):
     # how far off-centre (in side-sensor mm): positive = too far right (so steer left)
-    if wall_ahead(f, l, r, SIDES_BLIND_MM):
+    # a real wall straight ahead makes both angled side sensors read about the same (they hit
+    # the same wall). If they're very different it's a bad front reading, so keep steering
+    if wall_ahead(f, l, r, SIDES_BLIND_MM) and abs(l - r) < 40:
         return None, "front wall near"   # side beams are hitting the front wall, ignore them
     wall = centred * WALL_FACTOR
     if l < wall and r < wall:
@@ -322,32 +320,6 @@ def spin(d, until, timeout_ms, watch=None):
     return ((left_wheel.ticks - l0) + (right_wheel.ticks - r0)) // 2
 
 
-# ---- memory: which cell we're in, which way we face, how often we've visited each cell ----
-# heading 0 = the way it faced at the start, 1 = right of that, 2 = back, 3 = left
-DX = (0, 1, 0, -1)
-DY = (1, 0, -1, 0)
-visits = {(0, 0): 1}
-where = {"x": 0, "y": 0, "h": 0}
-turn_net = [0]   # turn() puts how far it really turned (ticks) in here
-
-
-def cell_ahead_by(cells, h):
-    return (where["x"] + DX[h] * cells, where["y"] + DY[h] * cells)
-
-
-def move_cells(cells):
-    # we've driven `cells` cells forward since the last cell centre: update the map
-    for i in range(cells):
-        where["x"] += DX[where["h"]]
-        where["y"] += DY[where["h"]]
-        key = (where["x"], where["y"])
-        visits[key] = visits.get(key, 0) + 1
-
-
-def visits_at(cell):
-    return visits.get(cell, 0)
-
-
 def turn(direction, sign):
     # turn (1 = left, -1 = right) until it's pointing straight down the next open corridor
     d = direction * sign              # if the steering was backwards, so is turning
@@ -377,7 +349,6 @@ def turn(direction, sign):
         back = total - w["best_at"]
         if back > 0:
             spin(-d, back, 3000)
-        turn_net[0] = w["best_at"]
         return "%s: no clear window in %d ticks, went back to the longest reading (%d mm) -> front now %d" % (
             name, total, w["best"], distance("front"))
     if lost is None:
@@ -385,7 +356,6 @@ def turn(direction, sign):
     back = total - (found + lost) // 2   # how far past the middle of the window it ended up
     if back > 0:
         spin(-d, back, 1500)
-    turn_net[0] = (found + lost) // 2
     return "%s: corridor from %d to %d ticks, ended at %d, turned back %d -> front now %d" % (
         name, found, lost, total, back, distance("front"))
 
@@ -458,21 +428,8 @@ def drive():
     gap_start = None
     wall_count = 0
     side_turns = 0
-    started_in_gap = False
-    if FOLLOW_SIDE == "right":
-        side0 = r
-    else:
-        side0 = l
-    if TAKE_SIDE_OPENINGS and side0 > centred * WALL_FACTOR:
-        # put down right beside an opening: we don't know where the gap began, so we'll
-        # work out the middle from where it ends instead
-        seen_left_wall = True
-        started_in_gap = True
-        gap_start = (left_wheel.ticks + right_wheel.ticks) // 2
-        log("Started beside an opening on the %s" % FOLLOW_SIDE)
     last_moving = time.ticks_ms()
     last_save = last_moving
-    centre_ticks = (left_wheel.ticks + right_wheel.ticks) // 2   # start = middle of cell (0,0)
 
     while time.ticks_diff(time.ticks_ms(), start) < MAX_SECONDS * 1000:
         f, l, r = distance("front"), distance("left"), distance("right")
@@ -506,19 +463,7 @@ def drive():
                 first_open, other_open, first_dir = open_right, open_left, -1
             else:
                 first_open, other_open, first_dir = open_left, open_right, 1
-            # update the map: how many cells did we drive since the last cell centre?
-            moved_now = (left_wheel.ticks + right_wheel.ticks) // 2
-            move_cells(int((moved_now - centre_ticks) / (CELL_MM * TICKS_PER_MM) + 0.5))
-            here = (where["x"], where["y"])
-            # neighbour cells: turning right = heading + 1, left = heading - 1
-            first_h = (where["h"] - first_dir) % 4
-            other_h = (where["h"] + first_dir) % 4
-            first_seen = visits_at(cell_ahead_by(1, first_h))
-            other_seen = visits_at(cell_ahead_by(1, other_h))
-            if USE_MEMORY and first_open and other_open and other_seen < first_seen:
-                direction = -first_dir
-                why = "both open, other side is new (visits %d vs %d)" % (other_seen, first_seen)
-            elif first_open or first_open is None:
+            if first_open or first_open is None:
                 direction = first_dir
                 why = FOLLOW_SIDE + (" open" if first_open else " (not sure)")
             elif other_open:
@@ -526,23 +471,16 @@ def drive():
                 why = "other side open"
             else:
                 direction, why = 1, "dead end, turning round"
-            why += " at cell %s facing %d" % (here, where["h"])
             why += " [open readings L %d R %d of %d]" % (open_l_count, open_r_count, seen_ahead)
             turns += 1
-            turn_net[0] = 0
             result = turn(direction, sign)
-            # how many quarter turns did it really do? (the gap finder can end up somewhere
-            # else than we asked, e.g. all the way round)
-            quarters = int(turn_net[0] / TURN_90_REAL + 0.5)
-            where["h"] = (where["h"] - direction * quarters) % 4
-            trace.append("TURN %d at %d ms: %s. %s. now facing %d" % (
-                turns, time.ticks_diff(time.ticks_ms(), start), why, result, where["h"]))
+            trace.append("TURN %d at %d ms: %s. %s" % (
+                turns, time.ticks_diff(time.ticks_ms(), start), why, result))
             save_log(trace)               # so switching off mid-run doesn't lose everything
             close_count = 0
             open_left = open_right = None
             open_l_count = open_r_count = seen_ahead = 0
             last_turn_ticks = (left_wheel.ticks + right_wheel.ticks) // 2
-            centre_ticks = last_turn_ticks
             last_mode, last_err, smooth_err, rate = None, None, None, 0
             left_speed.reset()
             right_speed.reset()
@@ -553,7 +491,6 @@ def drive():
             turn_at_ticks = None
             gap_start = None
             wall_count = 0
-            started_in_gap = False
             continue
 
         # ---- side openings (on the FOLLOW_SIDE) ----
@@ -563,18 +500,25 @@ def drive():
             side, other = r, l
         else:
             side, other = l, r
-        # if we're close to the other wall, this wall reads further away than usual,
-        # so move the "open" line up to match (otherwise a wall looks like a gap)
+        # where should this side's wall be? If we're off-centre the two sides add up to about
+        # 2 x centred, so close to this wall it reads short and an opening only reads a bit
+        # longer than normal (18 Nov: hugging the right wall, the first gap only read ~210 and
+        # got thrown away as too short). So the "open" line follows where the wall should be.
         gap_line = centred * WALL_FACTOR
         if other < centred * WALL_FACTOR:
-            gap_line = max(gap_line, (2 * centred - other) * 1.4)
+            expected = 2 * centred - other
+            gap_line = expected * WALL_FACTOR
+            if gap_line < 130:
+                gap_line = 130
+            if gap_line > 260:
+                gap_line = 260
         if TAKE_SIDE_OPENINGS and turn_at_ticks is None:
             now_ms = time.ticks_diff(time.ticks_ms(), start)
             if side < gap_line:
                 seen_left_wall = True
                 left_gap_count = 0
                 wall_count += 1
-                if gap_start is not None and wall_count >= OPEN_COUNT and not started_in_gap and \
+                if gap_start is not None and wall_count >= OPEN_COUNT and \
                         moved - gap_start < GAP_MIN_MM * TICKS_PER_MM:
                     trace.append("ignored a %d mm gap (too short to be real)" % (
                         (moved - gap_start) / TICKS_PER_MM))
@@ -582,10 +526,6 @@ def drive():
                 if gap_start is not None and wall_count >= OPEN_COUNT:
                     # far corner of the gap: the middle is halfway between start and here
                     middle = (gap_start + moved) // 2
-                    if started_in_gap:
-                        # we didn't see where it started, so go back half a gap from the end
-                        middle = moved - int(GAP_SEEN_MM / 2 * TICKS_PER_MM)
-                        started_in_gap = False
                     turn_at_ticks = middle + int(LOOK_AHEAD_MM * TICKS_PER_MM)
                     trace.append("GAP END at %d ms, gap was %d mm long, turning in %d mm" % (
                         now_ms, (moved - gap_start) / TICKS_PER_MM,
@@ -605,38 +545,21 @@ def drive():
                 gap_start = None
 
         if turn_at_ticks is not None and moved >= turn_at_ticks:
+            stop()
+            time.sleep_ms(SETTLE_MS)
             if FOLLOW_SIDE == "right":
                 d = -1
             else:
                 d = 1
-            cells = int((moved - centre_ticks) / (CELL_MM * TICKS_PER_MM) + 0.5)
-            here = cell_ahead_by(cells, where["h"])
-            gap_cell = (here[0] + DX[(where["h"] - d) % 4], here[1] + DY[(where["h"] - d) % 4])
-            ahead_cell = (here[0] + DX[where["h"]], here[1] + DY[where["h"]])
-            if USE_MEMORY and visits_at(gap_cell) > visits_at(ahead_cell):
-                # been down there before and straight on is newer: don't go back that way
-                trace.append("SKIPPED gap at cell %s: been there %d times, ahead %d" % (
-                    here, visits_at(gap_cell), visits_at(ahead_cell)))
-                turn_at_ticks = None
-                seen_left_wall = False
-                gap_start = None
-                started_in_gap = False
-                continue
-            move_cells(cells)
-            stop()
-            time.sleep_ms(SETTLE_MS)
             got = spin(d * sign, TURN_90_TICKS, 2000)
-            where["h"] = (where["h"] - d) % 4
             side_turns += 1
-            trace.append("SIDE TURN %d at %d ms: %s 90, %d ticks, front now %d, at cell %s facing %d" % (
-                side_turns, time.ticks_diff(time.ticks_ms(), start), FOLLOW_SIDE, got, distance("front"),
-                (where["x"], where["y"]), where["h"]))
+            trace.append("SIDE TURN %d at %d ms: %s 90, %d ticks, front now %d" % (
+                side_turns, time.ticks_diff(time.ticks_ms(), start), FOLLOW_SIDE, got, distance("front")))
             save_log(trace)
             close_count = 0
             open_left = open_right = None
             open_l_count = open_r_count = seen_ahead = 0
             last_turn_ticks = (left_wheel.ticks + right_wheel.ticks) // 2
-            centre_ticks = last_turn_ticks
             last_mode, last_err, smooth_err, rate = None, None, None, 0
             left_speed.reset()
             right_speed.reset()
@@ -647,7 +570,6 @@ def drive():
             turn_at_ticks = None
             gap_start = None
             wall_count = 0
-            started_in_gap = False
             continue
 
         now = time.ticks_ms()
@@ -720,7 +642,6 @@ def drive():
     log("Power at the end: left %.2f  right %.2f  (use these as START_POWER_LEFT/RIGHT)"
         % (left_speed.power, right_speed.power))
     log("Centred side reading at the end: %d mm" % centred)
-    log("Cells visited (cell: times):", visits)
     log("Trace (ms front left right off-centre rate steer powerL powerR), and turns:")
     for t in trace:
         log(t)
