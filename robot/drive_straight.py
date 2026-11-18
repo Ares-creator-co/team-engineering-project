@@ -1,42 +1,39 @@
-# drive_straight.py - drives round the maze, keeping centred in each corridor.
-# When it gets to a wall it turns (left if open, then right, otherwise turns round) and keeps going.
+# drive_straight.py
+# Drives through the maze staying in the middle of the corridor. When it gets to a wall
+# it turns (left if it can, then right, otherwise turns around) and keeps going.
 #
-# Put it on the Pico as main.py. Place the robot in a corridor and switch the battery on,
-# it starts straight away. LED is on while it's driving.
-# It won't drive if USB is plugged in, so it's safe to plug in and read last_run.txt after a run.
-# Needs vl53l4cd.py on the Pico too.
+# Save on the Pico as main.py with vl53l4cd.py. Put it in a corridor and turn it on.
+# It doesn't drive when USB is plugged in so you can read last_run.txt after a run.
 from machine import Pin, PWM, I2C
 import time
 from vl53l4cd import VL53L4CD, set_address
 
-# ---- settings ----
-TARGET_SPEED = 400       # encoder ticks/s for each wheel
-START_POWER_LEFT = 0.22  # starting motor power, the speed control adjusts it from here
+# settings
+TARGET_SPEED = 400       # ticks per second for each wheel
+START_POWER_LEFT = 0.22  # what the motors start at, speed control changes it after
 START_POWER_RIGHT = 0.16
-SPEED_GAIN = 0.00008     # how quickly the power changes to fix the speed (too high = it hunts)
+SPEED_GAIN = 0.00008
 
-# side sensors point 30 deg out from the front so they look ahead a bit, which means
-# left - right changes with both position and angle. numbers below are in sensor mm
-STEER_P = 0.002          # steering per mm off centre. raise if it drifts
-STEER_D = 0.0006         # damping, steering per mm/s. raise if it weaves
-MAX_STEER = 0.35         # max difference between wheel speeds (35%)
-SMOOTH = 0.5             # filter on the readings, lower = smoother but slower to react
-SIDE_GUESS_MM = 100      # backup centred reading if the start readings are rubbish
-WALL_FACTOR = 1.6        # side reading below centred x 1.6 counts as a wall
-SIDES_BLIND_MM = 120     # if the front wall is closer than this the side sensors see it, so don't steer
-TURN_AT_MM = 40          # turn when the front wall is this close
+# the side sensors are angled 30 deg forward so these are in "sensor mm" not real sideways mm
+STEER_P = 0.002          # turn up if it drifts into a wall
+STEER_D = 0.0006         # turn up if it wobbles side to side
+MAX_STEER = 0.35
+SMOOTH = 0.5
+SIDE_GUESS_MM = 100      # only used if the start readings are wrong
+WALL_FACTOR = 1.6        # side reading less than centred * this = wall there
+SIDES_BLIND_MM = 120     # side sensors can see the front wall when it's closer than this
+TURN_AT_MM = 50          # how close to the front wall before turning (was 40)
 
-TURN_SPEED = 250         # wheel speed when turning on the spot
-TURN_CLEAR_MM = 150      # front reading above this = looking into an open cell
-TURN_MAX_WINDOW = 200    # stop looking for the end of the gap after this many ticks
+TURN_SPEED = 250
+TURN_CLEAR_MM = 150      # front reading more than this = open cell
+TURN_MAX_WINDOW = 200
 TURN_TIMEOUT_MS = 4000
-MAX_SECONDS = 60         # how long a run lasts
+MAX_SECONDS = 60
 
 REVERSE_LEFT = True
 REVERSE_RIGHT = True
 DRIVE_ON_USB = False
 
-# ---- logging ----
 led = Pin("LED", Pin.OUT, value=0)
 lines = []
 
@@ -49,23 +46,25 @@ def log(*parts):
 
 def save_log(extra=()):
     try:
-        with open("last_run.txt", "w") as f:
-            f.write("\n".join(lines) + "\n")
-            if extra:
-                f.write("(saved mid-run, trace so far:)\n" + "\n".join(extra) + "\n")
+        f = open("last_run.txt", "w")
+        f.write("\n".join(lines) + "\n")
+        if extra:
+            f.write("(saved mid-run, trace so far:)\n" + "\n".join(extra) + "\n")
+        f.close()
     except Exception as e:
         print("could not save log:", e)
 
 
-# ---- motors ----
+# motors
 class Wheel:
     def __init__(self, in1, in2, enable, enc_a, enc_b, reverse):
         self.a = PWM(Pin(in1))
         self.b = PWM(Pin(in2))
-        for p in (self.a, self.b):
-            p.freq(1000)
-            p.duty_u16(0)
-        Pin(enable, Pin.OUT, value=1)   # PWMA/PWMB just held high, speed is set on IN1/IN2
+        self.a.freq(1000)
+        self.b.freq(1000)
+        self.a.duty_u16(0)
+        self.b.duty_u16(0)
+        Pin(enable, Pin.OUT, value=1)   # PWMA/PWMB always on, we PWM the IN pins instead
         self.reverse = reverse
         self.ticks = 0
         self.enc_a = Pin(enc_a, Pin.IN, Pin.PULL_UP)
@@ -76,12 +75,18 @@ class Wheel:
         self.ticks += 1
 
     def power(self, p):
-        # -1 to 1, negative is backwards
+        # p goes from -1 to 1, minus = backwards
         duty = int(min(1.0, abs(p)) * 65535)
-        forwards = (p >= 0) != self.reverse
-        on, off = (self.a, self.b) if forwards else (self.b, self.a)
-        off.duty_u16(0)
-        on.duty_u16(duty)
+        if self.reverse:
+            forwards = p < 0
+        else:
+            forwards = p >= 0
+        if forwards:
+            self.b.duty_u16(0)
+            self.a.duty_u16(duty)
+        else:
+            self.a.duty_u16(0)
+            self.b.duty_u16(duty)
 
     def stop(self):
         self.a.duty_u16(0)
@@ -97,43 +102,59 @@ def stop():
     right_wheel.stop()
 
 
+# speed control for one wheel - every 50ms check the speed and change the power a bit.
+# our motors aren't the same so each wheel needs its own
 class Speed:
-    # keeps one wheel at a set speed. every 50ms it checks the ticks and nudges the power.
-    # this is why it drives straight even though our motors aren't matched
     def __init__(self, wheel, power):
-        self.wheel, self.power, self.speed = wheel, power, 0
+        self.wheel = wheel
+        self.power = power
+        self.speed = 0
         self.reset()
 
     def reset(self):
-        self.last_ticks, self.last_time = self.wheel.ticks, time.ticks_ms()
+        self.last_ticks = self.wheel.ticks
+        self.last_time = time.ticks_ms()
 
     def drive(self, target):
         now = time.ticks_ms()
         dt = time.ticks_diff(now, self.last_time)
         if dt >= 50:
             self.speed = (self.wheel.ticks - self.last_ticks) * 1000 // dt
-            self.last_ticks, self.last_time = self.wheel.ticks, now
+            self.last_ticks = self.wheel.ticks
+            self.last_time = now
             change = SPEED_GAIN * (abs(target) - self.speed)
-            self.power += max(-0.05, min(0.05, change))
-            self.power = max(0.05, min(1.0, self.power))
-        # encoders only count, they don't know direction, so a negative target just flips the motor
-        self.wheel.power(self.power if target >= 0 else -self.power)
+            if change > 0.05:
+                change = 0.05
+            if change < -0.05:
+                change = -0.05
+            self.power += change
+            if self.power > 1.0:
+                self.power = 1.0
+            if self.power < 0.05:
+                self.power = 0.05
+        # encoders can't tell direction so for backwards just flip the motor
+        if target >= 0:
+            self.wheel.power(self.power)
+        else:
+            self.wheel.power(-self.power)
 
 
 left_speed = Speed(left_wheel, START_POWER_LEFT)
 right_speed = Speed(right_wheel, START_POWER_RIGHT)
 
 
-# ---- sensors ----
-# front and left XSHUT got swapped when soldering, so front is GP11 and left is GP10
+# sensors
+# front and left xshut wires got swapped when we soldered it
 SENSORS = (("front", 11, 0x30), ("left", 10, 0x31), ("right", 12, 0x32))
 i2c = I2C(0, sda=Pin(0), scl=Pin(1), freq=400_000)
-xshut = {name: Pin(pin, Pin.OUT, value=0) for name, pin, addr in SENSORS}
+xshut = {}
+for name, pin, addr in SENSORS:
+    xshut[name] = Pin(pin, Pin.OUT, value=0)
 tof = {}
 
 
 def start_sensors():
-    # all three start on address 0x29, so turn them on one at a time and give each a new address
+    # they all start as 0x29 so turn them on one by one and change the address
     time.sleep_ms(50)
     for name, pin, addr in SENSORS:
         for attempt in range(3):
@@ -148,7 +169,10 @@ def start_sensors():
                 break
             except Exception as e:
                 log(name, "sensor attempt", attempt + 1, "failed:", e)
-        log(name, "sensor", "OK" if name in tof else "FAILED")
+        if name in tof:
+            log(name, "sensor OK")
+        else:
+            log(name, "sensor FAILED")
 
 
 last_good = {}
@@ -160,16 +184,18 @@ def distance(name):
     try:
         d = tof[name].read()
     except OSError:
-        # the I2C bus glitches now and then (EIO), just reuse the last reading
-        return last_good.get(name, 9999)
-    d = 9999 if d is None else d
+        # i2c sometimes gives EIO, just use the last reading
+        if name in last_good:
+            return last_good[name]
+        return 9999
+    if d is None:
+        d = 9999
     last_good[name] = d
     return d
 
 
-# ---- steering ----
 def off_centre(f, l, r, centred):
-    # positive = too far right, so steer left
+    # + means too far right so steer left
     if f < SIDES_BLIND_MM:
         return None, "front wall near"
     wall = centred * WALL_FACTOR
@@ -182,11 +208,12 @@ def off_centre(f, l, r, centred):
     return None, "no walls"
 
 
-# ---- turning ----
+# turning
 def spin(d, until, timeout_ms, watch=None):
-    # turn on the spot, d = 1 for left, -1 for right.
-    # angle is the average ticks of both wheels. stops at `until` or when watch() says so
-    l0, r0 = left_wheel.ticks, right_wheel.ticks
+    # spin on the spot. d=1 left, d=-1 right
+    # angle = average ticks of the 2 wheels. stops when it gets to until or watch returns True
+    l0 = left_wheel.ticks
+    r0 = right_wheel.ticks
     left_speed.reset()
     right_speed.reset()
     t0 = time.ticks_ms()
@@ -205,37 +232,45 @@ def spin(d, until, timeout_ms, watch=None):
 
 
 def turn(direction):
-    # Turns until the front sensor sees into an open cell (reading goes long), keeps turning until
-    # it sees a wall again, then turns back to halfway between the two. That puts it facing
-    # straight down the corridor without needing to know how many ticks a 90 is.
-    w = {"found": None, "lost": None, "long": 0, "short": 0, "best": 0, "best_at": 0}
+    # Spin until the front sensor reads long (looking into an open cell), keep going until
+    # it reads short again, then turn back half way. That's facing straight down the gap.
+    s = {"found": None, "lost": None, "long": 0, "short": 0, "best": 0, "best_at": 0}
 
     def watch(angle, f):
-        if f > w["best"] and f < 2000:
-            w["best"], w["best_at"] = f, angle
-        # need 2 readings in a row so one bad reading doesn't count
+        if f > s["best"] and f < 2000:
+            s["best"] = f
+            s["best_at"] = angle
+        # 2 in a row so one dodgy reading doesn't mess it up
         if f > TURN_CLEAR_MM:
-            w["long"], w["short"] = w["long"] + 1, 0
+            s["long"] += 1
+            s["short"] = 0
         else:
-            w["long"], w["short"] = 0, w["short"] + 1
-        if w["found"] is None:
-            if w["long"] >= 2 and angle > 20:
-                w["found"] = angle
-        elif w["short"] >= 2 or angle - w["found"] > TURN_MAX_WINDOW:
-            w["lost"] = angle
+            s["long"] = 0
+            s["short"] += 1
+        if s["found"] is None:
+            if s["long"] >= 2 and angle > 20:
+                s["found"] = angle
+        elif s["short"] >= 2 or angle - s["found"] > TURN_MAX_WINDOW:
+            s["lost"] = angle
             return True
         return False
 
     total = spin(direction, None, TURN_TIMEOUT_MS, watch)
-    found, lost = w["found"], w["lost"]
-    name = "left" if direction > 0 else "right"
+    found = s["found"]
+    lost = s["lost"]
+    if direction > 0:
+        name = "left"
+    else:
+        name = "right"
+
     if found is None:
-        # didn't find a gap, go back to wherever the front reading was longest
-        back = total - w["best_at"]
+        # never found a gap so go back to the longest reading
+        back = total - s["best_at"]
         if back > 0:
             spin(-direction, back, 3000)
         return "%s: no gap in %d ticks, went back to longest reading (%d mm), front now %d" % (
-            name, total, w["best"], distance("front"))
+            name, total, s["best"], distance("front"))
+
     if lost is None:
         lost = total
     back = total - (found + lost) // 2
@@ -246,21 +281,23 @@ def turn(direction):
 
 
 def edge(d, limit):
-    # turn until the front sensor goes from seeing the corridor to seeing a wall
-    w = {"short": 0, "seen": False}
+    # spin until the front goes from open to wall
+    s = {"short": 0, "seen": False}
 
     def watch(angle, f):
         if f >= TURN_CLEAR_MM:
-            w["seen"], w["short"] = True, 0
-        elif w["seen"]:
-            w["short"] += 1
-        return w["short"] >= 2
+            s["seen"] = True
+            s["short"] = 0
+        elif s["seen"]:
+            s["short"] += 1
+        return s["short"] >= 2
+
     return spin(d, limit, 3000, watch)
 
 
 def line_up():
-    # at the start, find both edges of the corridor and point down the middle,
-    # so it doesn't matter if we put it down a bit crooked
+    # find the left and right edges of the corridor and face the middle
+    # so it still works if we put it down crooked
     if distance("front") < TURN_CLEAR_MM:
         return "facing a wall, turning to find a corridor: " + turn(1)
     a = edge(1, 150)
@@ -269,61 +306,88 @@ def line_up():
     return "edges %d left, %d right, went back %d, front now %d" % (a, b, b // 2, distance("front"))
 
 
-# ---- main loop ----
 def drive():
     log("Line up:", line_up())
-    f, l, r = distance("front"), distance("left"), distance("right")
+    f = distance("front")
+    l = distance("left")
+    r = distance("right")
     log("Start: front %d  left %d  right %d mm" % (f, l, r))
-    # start cell has walls both sides, so the average is what a centred robot reads
+    # walls on both sides at the start so the average = what it reads in the middle
     centred = (l + r) / 2
-    if not 40 <= centred <= 200:
+    if centred < 40 or centred > 200:
         log("Start side readings look wrong, using SIDE_GUESS_MM")
         centred = SIDE_GUESS_MM
     log("Centred side reading: %d mm" % centred)
     save_log()
 
-    last_time = loop_time = last_trace = start = time.ticks_ms()
+    start = time.ticks_ms()
+    last_time = start
+    loop_time = start
+    last_trace = start
     left_speed.reset()
     right_speed.reset()
-    speeds, closest_side = [], 9999
+    speeds = []
+    closest_side = 9999
     trace = []
-    last_mode, last_err, smooth_err, rate = None, None, None, 0
+    last_mode = None
+    last_err = None
+    smooth_err = None
+    rate = 0
     modes = {}
     close_count = 0
     turns = 0
-    # Right at the wall the side sensors only see the front wall, so we work out which sides
-    # are open while still 120-280mm away and remember it
-    open_left = open_right = None
+    # when it's right at the wall the side sensors only see the front wall,
+    # so check which sides are open a bit before and remember it
+    open_left = None
+    open_right = None
 
     while time.ticks_diff(time.ticks_ms(), start) < MAX_SECONDS * 1000:
-        f, l, r = distance("front"), distance("left"), distance("right")
+        f = distance("front")
+        l = distance("left")
+        r = distance("right")
         closest_side = min(closest_side, l, r)
-        if SIDES_BLIND_MM <= f <= 280:
+        if f >= SIDES_BLIND_MM and f <= 280:
             open_left = l > centred * WALL_FACTOR
             open_right = r > centred * WALL_FACTOR
 
-        # wall in front (2 readings in a row) -> pick a way and turn
-        close_count = close_count + 1 if f < TURN_AT_MM else 0
+        # wall in front? needs 2 readings in a row
+        if f < TURN_AT_MM:
+            close_count += 1
+        else:
+            close_count = 0
+
         if close_count >= 2:
             stop()
             time.sleep_ms(80)
             if open_left or open_left is None:
-                direction, why = 1, "left open" if open_left else "not sure, try left"
+                direction = 1
+                if open_left:
+                    why = "left open"
+                else:
+                    why = "not sure, try left"
             elif open_right:
-                direction, why = -1, "right open"
+                direction = -1
+                why = "right open"
             else:
-                direction, why = 1, "dead end, turning round"
+                direction = 1
+                why = "dead end, turning round"
             turns += 1
             result = turn(direction)
             trace.append("TURN %d at %d ms: %s. %s" % (
                 turns, time.ticks_diff(time.ticks_ms(), start), why, result))
-            save_log(trace)   # save after every turn in case we switch it off mid-run
+            save_log(trace)   # save every turn incase we turn it off
+            # reset everything for the new corridor
             close_count = 0
-            open_left = open_right = None
-            last_mode, last_err, smooth_err, rate = None, None, None, 0
+            open_left = None
+            open_right = None
+            last_mode = None
+            last_err = None
+            smooth_err = None
+            rate = 0
             left_speed.reset()
             right_speed.reset()
-            last_time = loop_time = time.ticks_ms()
+            last_time = time.ticks_ms()
+            loop_time = last_time
             continue
 
         now = time.ticks_ms()
@@ -334,11 +398,15 @@ def drive():
             last_time = now
             speeds.append("%d/%d" % (left_speed.speed, right_speed.speed))
 
-        # PD steering: P = how far off centre, D = how fast that's changing (stops it weaving)
+        # PD steering
+        # P = how far from the middle, D = how fast its moving towards a wall (stops the wobble)
         err, mode = off_centre(f, l, r, centred)
-        modes[mode] = modes.get(mode, 0) + 1
+        if mode in modes:
+            modes[mode] += 1
+        else:
+            modes[mode] = 1
         if mode == "both walls":
-            centred += 0.02 * ((l + r) / 2 - centred)   # slowly update the centred reading
+            centred += 0.02 * ((l + r) / 2 - centred)   # keep updating the middle reading slowly
         if err is None or mode != last_mode or last_err is None or dt <= 0:
             rate = 0
             smooth_err = err
@@ -346,30 +414,39 @@ def drive():
             smooth_err += SMOOTH * (err - smooth_err)
             new_rate = (smooth_err - last_err) / dt
             rate += SMOOTH * (new_rate - rate)
-        last_mode, last_err = mode, smooth_err
+        last_mode = mode
+        last_err = smooth_err
 
         if smooth_err is None:
             steer = 0
         else:
             steer = STEER_P * smooth_err + STEER_D * rate
-        steer = max(-MAX_STEER, min(MAX_STEER, steer))
-        # steer by giving the wheels different target speeds
+        if steer > MAX_STEER:
+            steer = MAX_STEER
+        if steer < -MAX_STEER:
+            steer = -MAX_STEER
+        # one wheel faster one slower
         left_speed.drive(TARGET_SPEED * (1 - steer))
         right_speed.drive(TARGET_SPEED * (1 + steer))
 
         if time.ticks_diff(now, last_trace) >= 200:
             last_trace = now
+            if smooth_err is None:
+                e = "-"
+            else:
+                e = "%d" % smooth_err
             trace.append("%5d %4d %4d %4d %6s %6s %5.2f %4.2f %4.2f" % (
-                time.ticks_diff(now, start), f, l, r,
-                "-" if smooth_err is None else "%d" % smooth_err, "%d" % rate, steer,
+                time.ticks_diff(now, start), f, l, r, e, "%d" % rate, steer,
                 left_speed.power, right_speed.power))
 
     stop()
     log("Stopped: time up after %d s, %d turns" % (MAX_SECONDS, turns))
     log("Ticks: left %d  right %d" % (left_wheel.ticks, right_wheel.ticks))
     if left_wheel.ticks < 50 or right_wheel.ticks < 50:
-        log("WARNING: %s wheel barely moved, check the motor/encoder"
-            % ("LEFT" if left_wheel.ticks < right_wheel.ticks else "RIGHT"))
+        if left_wheel.ticks < right_wheel.ticks:
+            log("WARNING: LEFT wheel barely moved, check the motor/encoder")
+        else:
+            log("WARNING: RIGHT wheel barely moved, check the motor/encoder")
     log("Closest a side reading got: %d mm" % closest_side)
     log("Steering used:", modes)
     log("Wheel speeds L/R every 0.2 s:", speeds)
@@ -380,10 +457,9 @@ def drive():
         log(t)
 
 
-# ---- start ----
 def usb_plugged_in():
     try:
-        return Pin("WL_GPIO2", Pin.IN).value() == 1   # VBUS pin on the Pico 2 W
+        return Pin("WL_GPIO2", Pin.IN).value() == 1   # VBUS on the pico 2 w
     except Exception:
         return False
 
@@ -398,7 +474,7 @@ def keep_previous_log():
 
 
 if usb_plugged_in() and not DRIVE_ON_USB:
-    # on USB: just print the sensors and don't touch the log from the last run
+    # plugged into laptop - just show sensors, don't drive
     start_sensors()
     print("USB connected, not driving. front %d  left %d  right %d mm"
           % (distance("front"), distance("left"), distance("right")))
