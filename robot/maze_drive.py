@@ -56,12 +56,16 @@ MAX_SECONDS = 60       # stop after this long
 FOLLOW_SIDE = "right"  # "right" = right-hand rule, "left" = left-hand rule
 TAKE_SIDE_OPENINGS = True
 TICKS_PER_MM = 2.5     # calibrated 18 Nov: 2507 ticks was about 1 m
-OPEN_TO_CENTRE_MM = 170  # from spotting the opening to the middle of it. Was 240 (turned too late).
-                         # 18 Nov log: it spots the gap about when the sensor is level with the
-                         # middle of it, and the sensor looks ~110 mm ahead + sits ~57 mm in front
-                         # of the wheels, so ~170 mm. Turns too early: raise it. Too late: lower it
+# Finding the middle of a gap: note where the side reading goes "open" and where it goes back
+# to "wall" (the far corner). Halfway between = middle of the gap, as seen by the sensor.
+# The sensor looks ~110 mm ahead and sits ~57 mm in front of the wheels, so the wheels reach
+# the middle of the gap LOOK_AHEAD_MM after that. Turns too early: raise it. Too late: lower it
+LOOK_AHEAD_MM = 165
+GAP_MAX_MM = 220       # gap still open after this far = no far wall (open area): turn at
+                       # gap start + LOOK_AHEAD_MM + 84 instead
+SETTLE_MS = 200        # stop and settle this long before turning in
 TURN_90_TICKS = 140    # ticks for a 90 deg turn (the 180s took ~285). Turns too far: lower it
-OPEN_COUNT = 3         # readings in a row that must say "open" before we believe it
+OPEN_COUNT = 2         # readings in a row that must say "open" (or "wall") before we believe it
 STUCK_MS = 500         # if the wheels hardly move for this long while driving, treat it as a wall
 REVERSE_LEFT = True    # flip if the left wheel turns the wrong way
 REVERSE_RIGHT = True   # flip if the right wheel turns the wrong way
@@ -405,6 +409,8 @@ def drive():
     seen_left_wall = False
     left_gap_count = 0
     turn_at_ticks = None
+    gap_start = None
+    wall_count = 0
     side_turns = 0
     last_moving = time.ticks_ms()
     last_save = last_moving
@@ -455,6 +461,8 @@ def drive():
             seen_left_wall = False
             left_gap_count = 0
             turn_at_ticks = None
+            gap_start = None
+            wall_count = 0
             continue
 
         # ---- side openings (on the FOLLOW_SIDE) ----
@@ -465,19 +473,35 @@ def drive():
         else:
             side = l
         if TAKE_SIDE_OPENINGS and turn_at_ticks is None:
+            now_ms = time.ticks_diff(time.ticks_ms(), start)
             if side < centred * WALL_FACTOR:
                 seen_left_wall = True
                 left_gap_count = 0
+                wall_count += 1
+                if gap_start is not None and wall_count >= OPEN_COUNT:
+                    # far corner of the gap: the middle is halfway between start and here
+                    middle = (gap_start + moved) // 2
+                    turn_at_ticks = middle + int(LOOK_AHEAD_MM * TICKS_PER_MM)
+                    trace.append("GAP END at %d ms, gap was %d mm long, turning in %d mm" % (
+                        now_ms, (moved - gap_start) / TICKS_PER_MM,
+                        (turn_at_ticks - moved) / TICKS_PER_MM))
+                    gap_start = None
             elif seen_left_wall:
+                wall_count = 0
                 left_gap_count += 1
-                if left_gap_count >= OPEN_COUNT:
-                    turn_at_ticks = moved + int(OPEN_TO_CENTRE_MM * TICKS_PER_MM)
-                    trace.append("OPENING on the %s at %d ms, will turn in %d mm" % (
-                        FOLLOW_SIDE, time.ticks_diff(time.ticks_ms(), start), OPEN_TO_CENTRE_MM))
+                if left_gap_count >= OPEN_COUNT and gap_start is None:
+                    gap_start = moved
+                    trace.append("GAP START on the %s at %d ms" % (FOLLOW_SIDE, now_ms))
+            if gap_start is not None and moved - gap_start > GAP_MAX_MM * TICKS_PER_MM:
+                # no far wall showed up: open area, so go from the start of the gap instead
+                turn_at_ticks = gap_start + int((LOOK_AHEAD_MM + 84) * TICKS_PER_MM)
+                trace.append("NO FAR WALL at %d ms, turning in %d mm" % (
+                    now_ms, (turn_at_ticks - moved) / TICKS_PER_MM))
+                gap_start = None
 
         if turn_at_ticks is not None and moved >= turn_at_ticks:
             stop()
-            time.sleep_ms(80)
+            time.sleep_ms(SETTLE_MS)
             if FOLLOW_SIDE == "right":
                 d = -1
             else:
@@ -497,6 +521,8 @@ def drive():
             seen_left_wall = False
             left_gap_count = 0
             turn_at_ticks = None
+            gap_start = None
+            wall_count = 0
             continue
 
         now = time.ticks_ms()
