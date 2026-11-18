@@ -39,7 +39,7 @@ SIDE_GUESS_MM = 100    # side reading when centred, only used if the start readi
                        # The robot learns the real value at the start and while it drives.
 WALL_FACTOR = 1.6      # a side reading under (centred reading x this) means there's a wall
 SIDES_BLIND_MM = 120   # front wall closer than this: the V sensors see it too, so stop steering
-TURN_AT_MM = 50        # turn when the wall in front is this close (2 readings in a row). was 40
+TURN_AT_MM = 60        # turn when the wall in front is this close (2 readings in a row). was 40, then 50
 # Turning finds the straight: while turning, the front sensor reads long (past TURN_CLEAR_MM)
 # for a window of ~40 deg while it looks down an open corridor. It notes where that window
 # starts and ends, then turns back to the middle of it = pointing straight down the corridor.
