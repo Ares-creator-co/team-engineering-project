@@ -38,7 +38,8 @@ STEER_P = 0.002        # steering per mm of (left - right)/2, as a fraction of s
 STEER_D = 0.0006       # steering per mm/s that difference changes (damping). Weaves: raise it
 MAX_STEER = 0.35       # most the wheel speeds differ by when steering (0.35 = +/-35%)
 SMOOTH = 0.5           # 0..1, how much of each new reading is used (lower = smoother, slower)
-SIDE_GUESS_MM = 100    # side reading when centred, only used if the start readings look wrong.
+SIDE_GUESS_MM = 127    # side reading when centred. Every run has measured 124-131 in our maze.
+                       # Only replaced by the start readings if both of those look like real walls
                        # The robot learns the real value at the start and while it drives.
 WALL_FACTOR = 1.6      # a side reading under (centred reading x this) means there's a wall
 SIDES_BLIND_MM = 120   # front wall closer than this: the V sensors see it too, so stop steering
@@ -66,7 +67,8 @@ GAP_MIN_MM = 40        # ignore 'gaps' shorter than this (real ones measure ~85 
 GAP_MAX_MM = 220       # gap still open after this far = no far wall (open area): turn at
                        # gap start + LOOK_AHEAD_MM + 84 instead
 SETTLE_MS = 200        # stop and settle this long before turning in
-TURN_90_TICKS = 140    # ticks for a 90 deg turn (the 180s took ~285). Turns too far: lower it
+TURN_90_TICKS = 130    # it coasts ~12 ticks after stopping, so this ends up ~142 = 90 deg
+                       # (was 140, which ended at 151-153 = ~97 deg). Turns too far: lower it
 OPEN_COUNT = 2         # readings in a row that must say "open" (or "wall") before we believe it
 STUCK_MS = 500         # if the wheels hardly move for this long while driving, treat it as a wall
 REVERSE_LEFT = True    # flip if the left wheel turns the wrong way
@@ -390,9 +392,13 @@ def drive():
     log("Start: front %d  left %d  right %d mm" % (f, l, r))
     # the start cell has walls on both sides, so the average of the two is the centred reading
     # (averaging means it doesn't matter if you put it down a bit off-centre)
-    centred = (l + r) / 2
-    if not 40 <= centred <= 200:
-        log("Start side readings look wrong, using SIDE_GUESS_MM")
+    # only trust the start readings if BOTH sides look like walls near the usual value.
+    # (started next to an opening on 18 Nov: averaged 111 and 246 = 178, and then it
+    # thought the opening was a wall)
+    if 95 <= l <= 160 and 95 <= r <= 160:
+        centred = (l + r) / 2
+    else:
+        log("Start side readings not both walls, using SIDE_GUESS_MM")
         centred = SIDE_GUESS_MM
     log("Centred side reading: %d mm" % centred)
     save_log()   # so there's a log even if the power is cut mid-run
