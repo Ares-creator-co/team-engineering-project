@@ -27,7 +27,7 @@ TARGET_SPEED = 400     # encoder ticks per second for each wheel. Lower = slower
 # Power each wheel starts at. The left motor needs far more than the right (wheel test 16 Nov:
 # at 0.3 the left barely moved, right did 1300 ticks/s). The speed control corrects these as
 # it drives; good starting values just stop it curving in the first second.
-START_POWER_LEFT = 0.42   # maze runs 18 Nov: left needed 0.40-0.49 (left motor is weak again)
+START_POWER_LEFT = 0.55   # 18 Nov maze_drive runs: left needed 0.49-0.61 (left motor keeps getting weaker)
 START_POWER_RIGHT = 0.22  # and the right ~0.20-0.26
 SPEED_GAIN = 0.00008   # power change every 50 ms per tick/s a wheel is off. Speed hunts: lower it
 # Side sensors point 30 deg out from straight ahead (a V), ~23 mm either side of the front sensor.
@@ -60,6 +60,7 @@ OPEN_TO_CENTRE_MM = 240  # from seeing the opening to the middle of that cell. T
                          # opening ~165 mm early, + ~84 mm to the middle. Turns too early: raise it
 TURN_90_TICKS = 140    # ticks for a 90 deg turn (the 180s took ~285). Turns too far: lower it
 OPEN_COUNT = 3         # readings in a row that must say "open" before we believe it
+STUCK_MS = 500         # if the wheels hardly move for this long while driving, treat it as a wall
 REVERSE_LEFT = True    # flip if the left wheel turns the wrong way
 REVERSE_RIGHT = True   # flip if the right wheel turns the wrong way
 LINE_UP = False        # False: just drive off straight as placed (the line-up turned left and hit walls)
@@ -258,6 +259,16 @@ def wall_ahead(f, l, r, near):
     return f < near and l < limit and r < limit
 
 
+def wall_ahead_turn(f, l, r):
+    # for deciding to turn: front close and at least one side sensor also close. When it's
+    # crooked against a wall one side sensor looks out into the open, so we can't need both
+    limit = 1.2 * f + 40
+    if f < TURN_AT_MM and (l < limit or r < limit):
+        return True
+    # jammed: wall fairly close in front and a side practically touching (wheels just slip here)
+    return f < TURN_AT_MM + 40 and (l < 30 or r < 30)
+
+
 def off_centre(f, l, r, centred):
     # how far off-centre (in side-sensor mm): positive = too far right (so steer left)
     if wall_ahead(f, l, r, SIDES_BLIND_MM):
@@ -393,6 +404,7 @@ def drive():
     left_gap_count = 0
     turn_at_ticks = None
     side_turns = 0
+    last_moving = time.ticks_ms()
 
     while time.ticks_diff(time.ticks_ms(), start) < MAX_SECONDS * 1000:
         f, l, r = distance("front"), distance("left"), distance("right")
@@ -402,8 +414,15 @@ def drive():
             open_right = r > centred * WALL_FACTOR
 
         # wall ahead: turn and carry on (2 close readings in a row, so one odd reading can't do it)
-        close_count = close_count + 1 if wall_ahead(f, l, r, TURN_AT_MM) else 0
-        if close_count >= 2:
+        close_count = close_count + 1 if wall_ahead_turn(f, l, r) else 0
+        # stuck: trying to drive but the wheels have hardly moved for STUCK_MS
+        if left_speed.speed + right_speed.speed > TARGET_SPEED // 2:
+            last_moving = time.ticks_ms()
+        stuck = time.ticks_diff(time.ticks_ms(), last_moving) > STUCK_MS
+        if stuck:
+            trace.append("STUCK at %d ms (wheels not moving), treating it as a wall" % (
+                time.ticks_diff(time.ticks_ms(), start)))
+        if close_count >= 2 or stuck:
             stop()
             time.sleep_ms(80)
             if open_left or open_left is None:
@@ -423,6 +442,7 @@ def drive():
             left_speed.reset()
             right_speed.reset()
             last_time = loop_time = time.ticks_ms()
+            last_moving = last_time
             seen_left_wall = False
             left_gap_count = 0
             turn_at_ticks = None
@@ -455,6 +475,7 @@ def drive():
             left_speed.reset()
             right_speed.reset()
             last_time = loop_time = time.ticks_ms()
+            last_moving = last_time
             seen_left_wall = False
             left_gap_count = 0
             turn_at_ticks = None
