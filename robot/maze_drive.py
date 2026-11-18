@@ -62,6 +62,7 @@ TICKS_PER_MM = 2.5     # calibrated 18 Nov: 2507 ticks was about 1 m
 # The sensor looks ~110 mm ahead and sits ~57 mm in front of the wheels, so the wheels reach
 # the middle of the gap LOOK_AHEAD_MM after that. Turns too early: raise it. Too late: lower it
 LOOK_AHEAD_MM = 120    # was 165: turned ~40-50 mm too late (18 Nov logs)
+GAP_SEEN_MM = 85       # how long a one-cell gap looks to the side sensor (measured 57-92)
 GAP_MIN_MM = 40        # ignore 'gaps' shorter than this (real ones measure ~85 mm, the sensor
                        # sees the far corner early so gaps look shorter than 168)
 GAP_MAX_MM = 220       # gap still open after this far = no far wall (open area): turn at
@@ -426,6 +427,18 @@ def drive():
     gap_start = None
     wall_count = 0
     side_turns = 0
+    started_in_gap = False
+    if FOLLOW_SIDE == "right":
+        side0 = r
+    else:
+        side0 = l
+    if TAKE_SIDE_OPENINGS and side0 > centred * WALL_FACTOR:
+        # put down right beside an opening: we don't know where the gap began, so we'll
+        # work out the middle from where it ends instead
+        seen_left_wall = True
+        started_in_gap = True
+        gap_start = (left_wheel.ticks + right_wheel.ticks) // 2
+        log("Started beside an opening on the %s" % FOLLOW_SIDE)
     last_moving = time.ticks_ms()
     last_save = last_moving
 
@@ -489,6 +502,7 @@ def drive():
             turn_at_ticks = None
             gap_start = None
             wall_count = 0
+            started_in_gap = False
             continue
 
         # ---- side openings (on the FOLLOW_SIDE) ----
@@ -504,7 +518,7 @@ def drive():
                 seen_left_wall = True
                 left_gap_count = 0
                 wall_count += 1
-                if gap_start is not None and wall_count >= OPEN_COUNT and \
+                if gap_start is not None and wall_count >= OPEN_COUNT and not started_in_gap and \
                         moved - gap_start < GAP_MIN_MM * TICKS_PER_MM:
                     trace.append("ignored a %d mm gap (too short to be real)" % (
                         (moved - gap_start) / TICKS_PER_MM))
@@ -512,6 +526,10 @@ def drive():
                 if gap_start is not None and wall_count >= OPEN_COUNT:
                     # far corner of the gap: the middle is halfway between start and here
                     middle = (gap_start + moved) // 2
+                    if started_in_gap:
+                        # we didn't see where it started, so go back half a gap from the end
+                        middle = moved - int(GAP_SEEN_MM / 2 * TICKS_PER_MM)
+                        started_in_gap = False
                     turn_at_ticks = middle + int(LOOK_AHEAD_MM * TICKS_PER_MM)
                     trace.append("GAP END at %d ms, gap was %d mm long, turning in %d mm" % (
                         now_ms, (moved - gap_start) / TICKS_PER_MM,
@@ -556,6 +574,7 @@ def drive():
             turn_at_ticks = None
             gap_start = None
             wall_count = 0
+            started_in_gap = False
             continue
 
         now = time.ticks_ms()
