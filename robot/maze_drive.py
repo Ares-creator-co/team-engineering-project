@@ -406,6 +406,7 @@ def drive():
     # so they see the last cell's side walls while the front wall is ~150-280 mm away. Right at
     # the wall they only see the front wall, so we remember what they saw on the way in.
     open_left = open_right = None
+    open_l_count = open_r_count = seen_ahead = 0
     # side openings: only count an opening after we've seen a left wall (wall -> gap), and
     # remember the tick count where we should turn
     seen_left_wall = False
@@ -420,9 +421,17 @@ def drive():
     while time.ticks_diff(time.ticks_ms(), start) < MAX_SECONDS * 1000:
         f, l, r = distance("front"), distance("left"), distance("right")
         closest_side = min(closest_side, l, r)
+        # which sides are open at the end of this corridor? Count "open" readings on the way in.
+        # Don't just use the last reading: right at the end the angled sensor can hit the wall
+        # ahead where it carries on past the gap (zigzags) and read "wall" when it's open
         if SIDES_BLIND_MM <= f <= 280:
-            open_left = l > centred * WALL_FACTOR
-            open_right = r > centred * WALL_FACTOR
+            seen_ahead += 1
+            if l > centred * WALL_FACTOR:
+                open_l_count += 1
+            if r > centred * WALL_FACTOR:
+                open_r_count += 1
+            open_left = open_l_count >= 2
+            open_right = open_r_count >= 2
 
         # wall ahead: turn and carry on (2 close readings in a row, so one odd reading can't do it)
         close_count = close_count + 1 if wall_ahead_turn(f, l, r) else 0
@@ -448,6 +457,7 @@ def drive():
                 why = "other side open"
             else:
                 direction, why = 1, "dead end, turning round"
+            why += " [open readings L %d R %d of %d]" % (open_l_count, open_r_count, seen_ahead)
             turns += 1
             result = turn(direction, sign)
             trace.append("TURN %d at %d ms: %s. %s" % (
@@ -455,6 +465,7 @@ def drive():
             save_log(trace)               # so switching off mid-run doesn't lose everything
             close_count = 0
             open_left = open_right = None
+            open_l_count = open_r_count = seen_ahead = 0
             last_mode, last_err, smooth_err, rate = None, None, None, 0
             left_speed.reset()
             right_speed.reset()
@@ -520,6 +531,7 @@ def drive():
             save_log(trace)
             close_count = 0
             open_left = open_right = None
+            open_l_count = open_r_count = seen_ahead = 0
             last_mode, last_err, smooth_err, rate = None, None, None, 0
             left_speed.reset()
             right_speed.reset()
