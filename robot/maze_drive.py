@@ -1,7 +1,7 @@
-# maze_drive.py - drive_straight.py plus turning into side openings (left-hand rule).
-# Same as drive_straight, but when it sees an opening on the LEFT partway down a corridor,
-# it drives on to the middle of that cell and turns left 90 deg into it.
-# At a wall ahead it does the same as drive_straight (left if open, else right, else turn round).
+# maze_drive.py - drive_straight.py plus turning into side openings (wall follower).
+# When it sees an opening on the FOLLOW_SIDE partway down a corridor, it drives on to the
+# middle of that cell and turns 90 deg into it.
+# At a wall ahead: FOLLOW_SIDE if open, else the other side, else turn round.
 # drive_straight.py is the saved working version, don't change that one.
 #
 # How to use: put the robot in a corridor pointing straight down it, switch the battery on.
@@ -53,7 +53,8 @@ TURN_MAX_WINDOW = 200  # ticks: if the long readings go on longer than this (ope
 TURN_TIMEOUT_MS = 4000 # give up on a turn after this long and just try driving
 MAX_SECONDS = 60       # stop after this long
 # turning into openings
-TAKE_LEFT_OPENINGS = True
+FOLLOW_SIDE = "right"  # "right" = right-hand rule, "left" = left-hand rule
+TAKE_SIDE_OPENINGS = True
 TICKS_PER_MM = 2.5     # calibrated 18 Nov: 2507 ticks was about 1 m
 OPEN_TO_CENTRE_MM = 240  # from seeing the opening to the middle of that cell. The side sensors
                          # look ~110 mm ahead and sit ~57 mm in front of the wheels, so it sees the
@@ -405,6 +406,7 @@ def drive():
     turn_at_ticks = None
     side_turns = 0
     last_moving = time.ticks_ms()
+    last_save = last_moving
 
     while time.ticks_diff(time.ticks_ms(), start) < MAX_SECONDS * 1000:
         f, l, r = distance("front"), distance("left"), distance("right")
@@ -425,10 +427,16 @@ def drive():
         if close_count >= 2 or stuck:
             stop()
             time.sleep_ms(80)
-            if open_left or open_left is None:
-                direction, why = 1, "left open" if open_left else "not sure, try left"
-            elif open_right:
-                direction, why = -1, "right open"
+            if FOLLOW_SIDE == "right":
+                first_open, other_open, first_dir = open_right, open_left, -1
+            else:
+                first_open, other_open, first_dir = open_left, open_right, 1
+            if first_open or first_open is None:
+                direction = first_dir
+                why = FOLLOW_SIDE + (" open" if first_open else " (not sure)")
+            elif other_open:
+                direction = -first_dir
+                why = "other side open"
             else:
                 direction, why = 1, "dead end, turning round"
             turns += 1
@@ -448,26 +456,35 @@ def drive():
             turn_at_ticks = None
             continue
 
-        # ---- left openings ----
+        # ---- side openings (on the FOLLOW_SIDE) ----
+        # (variable names say "left" from the first version, they mean the follow side)
         moved = (left_wheel.ticks + right_wheel.ticks) // 2
-        if TAKE_LEFT_OPENINGS and turn_at_ticks is None:
-            if l < centred * WALL_FACTOR:
+        if FOLLOW_SIDE == "right":
+            side = r
+        else:
+            side = l
+        if TAKE_SIDE_OPENINGS and turn_at_ticks is None:
+            if side < centred * WALL_FACTOR:
                 seen_left_wall = True
                 left_gap_count = 0
             elif seen_left_wall:
                 left_gap_count += 1
                 if left_gap_count >= OPEN_COUNT:
                     turn_at_ticks = moved + int(OPEN_TO_CENTRE_MM * TICKS_PER_MM)
-                    trace.append("OPENING on the left at %d ms, will turn in %d mm" % (
-                        time.ticks_diff(time.ticks_ms(), start), OPEN_TO_CENTRE_MM))
+                    trace.append("OPENING on the %s at %d ms, will turn in %d mm" % (
+                        FOLLOW_SIDE, time.ticks_diff(time.ticks_ms(), start), OPEN_TO_CENTRE_MM))
 
         if turn_at_ticks is not None and moved >= turn_at_ticks:
             stop()
             time.sleep_ms(80)
-            got = spin(sign, TURN_90_TICKS, 2000)     # sign: 1 = left
+            if FOLLOW_SIDE == "right":
+                d = -1
+            else:
+                d = 1
+            got = spin(d * sign, TURN_90_TICKS, 2000)
             side_turns += 1
-            trace.append("SIDE TURN %d at %d ms: left 90, %d ticks, front now %d" % (
-                side_turns, time.ticks_diff(time.ticks_ms(), start), got, distance("front")))
+            trace.append("SIDE TURN %d at %d ms: %s 90, %d ticks, front now %d" % (
+                side_turns, time.ticks_diff(time.ticks_ms(), start), FOLLOW_SIDE, got, distance("front")))
             save_log(trace)
             close_count = 0
             open_left = open_right = None
@@ -524,6 +541,10 @@ def drive():
         # steer by asking for different wheel speeds; each wheel's speed control finds the power
         left_speed.drive(TARGET_SPEED * (1 - steer))
         right_speed.drive(TARGET_SPEED * (1 + steer))
+
+        if time.ticks_diff(now, last_save) >= 2000:   # save every 2 s so we always get a log
+            last_save = now
+            save_log(trace)
 
         if time.ticks_diff(now, last_trace) >= 200:   # trace for tuning, 5 lines a second
             last_trace = now
