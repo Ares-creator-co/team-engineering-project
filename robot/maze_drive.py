@@ -52,7 +52,7 @@ TURN_CLEAR_MM = 150    # front reading longer than this = looking into an open c
                        # in the cell reads ~30-90; an open cell with a wall after it reads ~200
 TURN_MAX_WINDOW = 200  # ticks: if the long readings go on longer than this (open area), stop there
 TURN_TIMEOUT_MS = 4000 # give up on a turn after this long and just try driving
-MAX_SECONDS = 60       # stop after this long
+MAX_SECONDS = 180      # stop after this long (was 60; the competition allows 10 min)
 # turning into openings
 FOLLOW_SIDE = "right"  # "right" = right-hand rule, "left" = left-hand rule
 TAKE_SIDE_OPENINGS = True
@@ -62,6 +62,20 @@ TICKS_PER_MM = 2.5     # calibrated 18 Nov: 2507 ticks was about 1 m
 # The sensor looks ~110 mm ahead and sits ~57 mm in front of the wheels, so the wheels reach
 # the middle of the gap LOOK_AHEAD_MM after that. Turns too early: raise it. Too late: lower it
 LOOK_AHEAD_MM = 120    # was 165: turned ~40-50 mm too late (18 Nov logs)
+RAW_LOG_SECONDS = 15   # log EVERY sensor reading for this long at the start of a run
+GAP_WINDOW = 6         # gap detection looks at the last 6 side readings:
+GAP_IN = 3             # ...a gap starts when at least 3 of them say "open"
+GAP_OUT = 0            # ...and ends when none of them do. So readings flickering between
+                       # open and wall (beam clipping a corner) can't break a gap up, and one odd
+                       # high reading on a wall can't start a fake one
+GAP_JUMP_MM = 55       # a gap = the side reading jumps this much above what the wall was reading
+GAP_BACK_MM = 35       # ...and the gap is over when it's back within this of the wall reading
+GAP_AFTER_TURN_MM = 40   # a gap that starts this soon after a turn (not the start of the run)...
+GAP_AFTER_TURN_MIN = 75  # ...must be at least this long: just after a turn the sensor can see down
+                         # the corridor we came out of and make a short fake gap (44-52 mm in the
+                         # logs, real ones after turns were 92-112), and two rights = a U-turn
+TURN_MIN_WINDOW = 25   # while turning, an opening narrower than this (ticks) is a glimpse past a
+                       # corner, not a corridor (logs: real ones were 32+, a bad one was 16)
 GAP_MIN_MM = 40        # ignore 'gaps' shorter than this (real ones measure ~85 mm, the sensor
                        # sees the far corner early so gaps look shorter than 168)
 GAP_MAX_MM = 220       # gap still open after this far = no far wall (open area): turn at
@@ -70,11 +84,22 @@ SETTLE_MS = 200        # stop and settle this long before turning in
 TURN_90_TICKS = 130    # it coasts ~12 ticks after stopping, so this ends up ~142 = 90 deg
                        # (was 140, which ended at 151-153 = ~97 deg). Turns too far: lower it
 OPEN_COUNT = 2         # readings in a row that must say "open" (or "wall") before we believe it
+GAP_SPEED = 0.6        # drive at this fraction of TARGET_SPEED while lining up for a side turn
+STRAIGHTEN_MAX = 25    # after a turn, rotate up to this many ticks (~15 deg) to get left = right
+STRAIGHTEN_WALL = 170  # only straighten if both sides read under this (real corridor walls)
+STRAIGHTEN_OK = 15     # ...stop when left and right are within this of each other
+PINNED_MM = 35         # a side under this for PINNED_MS = rubbing on the wall: back off
+PINNED_CLEAR_MM = 45   # ...and it only counts as free again above this (readings bounce 19-27)
+PINNED_MS = 400
+NOT_MOVING_MS = 1000   # front reading changed less than NOT_MOVING_MM in this long = going nowhere
+NOT_MOVING_MM = 15     # (wheels slipping against a wall, 18 Nov: front stuck at ~190 for 4 s)
+BACK_OFF_MM = 40       # how far to reverse when pinned
+BACK_OFF_TURN = 25     # then turn this many ticks (~15 deg) away from the wall
 STUCK_MS = 500         # if the wheels hardly move for this long while driving, treat it as a wall
 REVERSE_LEFT = True    # flip if the left wheel turns the wrong way
 REVERSE_RIGHT = True   # flip if the right wheel turns the wrong way
 LINE_UP = False        # False: just drive off straight as placed (the line-up turned left and hit walls)
-TOO_CLOSE_MM = 65      # side reading under this (centred is ~125) = too close, steer away hard (was 55)
+TOO_CLOSE_MM = 75      # side reading under this (centred is ~125) = too close, steer away hard (was 65)
 AFTER_TURN_MM = 100    # drive slower for this far after every turn so the steering can centre it
 AFTER_TURN_SPEED = 0.6 # ... at this fraction of TARGET_SPEED
 IGNORE_AFTER_TURN_MM = 60  # after a turn the side sensors still see the corridor we just left,
@@ -95,12 +120,21 @@ def log(*parts):
     lines.append(line)
 
 
-def save_log(extra=()):
+trace = []   # trace lines waiting to be written to the file
+
+
+def save_log(extra=None):
+    # ADD the new lines to the end of last_run.txt, then forget them. (It used to rewrite the
+    # whole log every 2 s; with the raw readings that got too big for the Pico's memory after
+    # ~9 s and every save after that failed, so the rest of the run was lost.)
     try:
-        with open("last_run.txt", "w") as f:
-            f.write("\n".join(lines) + "\n")
-            if extra:
-                f.write("(saved mid-run, trace so far:)\n" + "\n".join(extra) + "\n")
+        with open("last_run.txt", "a") as f:
+            if lines:
+                f.write("\n".join(lines) + "\n")
+            if trace:
+                f.write("\n".join(trace) + "\n")
+        del lines[:]
+        del trace[:]
     except Exception as e:
         print("could not save log:", e)
 
@@ -320,6 +354,39 @@ def spin(d, until, timeout_ms, watch=None):
     return ((left_wheel.ticks - l0) + (right_wheel.ticks - r0)) // 2
 
 
+def straighten():
+    # The angled side sensors read the same when we're pointing at the middle of the corridor
+    # ahead. So after a side turn, rotate on the spot until left = right. Only if both walls
+    # are there (an open side would just pull us towards it).
+    l, r = distance("left"), distance("right")
+    if l > STRAIGHTEN_WALL or r > STRAIGHTEN_WALL:
+        return "skipped (left %d right %d, not both walls)" % (l, r)
+    if abs(l - r) < STRAIGHTEN_OK:
+        return "already straight (left %d right %d)" % (l, r)
+    if l < r:
+        d = -1      # pointing towards the left wall: rotate right
+    else:
+        d = 1
+    l0, r0 = left_wheel.ticks, right_wheel.ticks
+    left_speed.reset()
+    right_speed.reset()
+    t0 = time.ticks_ms()
+    while time.ticks_diff(time.ticks_ms(), t0) < 1000:
+        if ((left_wheel.ticks - l0) + (right_wheel.ticks - r0)) // 2 > STRAIGHTEN_MAX:
+            break
+        left_speed.drive(-TURN_SPEED * 0.6 * d)
+        right_speed.drive(TURN_SPEED * 0.6 * d)
+        l, r = distance("left"), distance("right")
+        if abs(l - r) < STRAIGHTEN_OK or (d < 0 and l > r) or (d > 0 and r > l):
+            break
+        if l > STRAIGHTEN_WALL or r > STRAIGHTEN_WALL:
+            break          # a side opened up: we're looking into a junction, stop here
+    stop()
+    time.sleep_ms(80)
+    return "rotated %s %d ticks, now left %d right %d" % (
+        "right" if d < 0 else "left", ((left_wheel.ticks - l0) + (right_wheel.ticks - r0)) // 2, l, r)
+
+
 def turn(direction, sign):
     # turn (1 = left, -1 = right) until it's pointing straight down the next open corridor
     d = direction * sign              # if the steering was backwards, so is turning
@@ -337,6 +404,9 @@ def turn(direction, sign):
             if w["long"] >= 2 and angle > 20:
                 w["found"] = angle
         elif w["short"] >= 2 or angle - w["found"] > TURN_MAX_WINDOW:
+            if angle - w["found"] < TURN_MIN_WINDOW:
+                w["found"] = None          # too narrow to be a corridor, keep turning
+                return False
             w["lost"] = angle
             return True
         return False
@@ -409,7 +479,7 @@ def drive():
     left_speed.reset()
     right_speed.reset()
     speeds, closest_side = [], 9999
-    trace = []
+    del trace[:]
     last_mode, last_err, smooth_err, rate = None, None, None, 0
     modes = {}
     close_count = 0
@@ -428,11 +498,22 @@ def drive():
     gap_start = None
     wall_count = 0
     side_turns = 0
+    turned_yet = False        # the "just after a turn" rule doesn't apply at the start of the run
+    gap_after_turn = False
+    side_hist = []
+    side_wall = centred       # running average of what the follow-side wall reads
     last_moving = time.ticks_ms()
+    pinned_since = None
+    front_ref = None
+    front_ref_time = time.ticks_ms()
+    back_offs = 0
     last_save = last_moving
 
     while time.ticks_diff(time.ticks_ms(), start) < MAX_SECONDS * 1000:
         f, l, r = distance("front"), distance("left"), distance("right")
+        raw_ms = time.ticks_diff(time.ticks_ms(), start)
+        if raw_ms < RAW_LOG_SECONDS * 1000:
+            trace.append("R %d %d %d %d" % (raw_ms, f, l, r))
         since_turn = ((left_wheel.ticks + right_wheel.ticks) // 2 - last_turn_ticks) / TICKS_PER_MM
         closest_side = min(closest_side, l, r)
         # which sides are open at the end of this corridor? Count "open" readings on the way in.
@@ -446,6 +527,62 @@ def drive():
                 open_r_count += 1
             open_left = open_l_count >= 3
             open_right = open_r_count >= 3
+
+        # pinned against a side wall: turning on the spot just swings the back into the wall and
+        # the wheels slip, so reverse a bit, turn away from the wall, then carry on
+        if min(l, r) < PINNED_MM:
+            if pinned_since is None:
+                pinned_since = time.ticks_ms()
+        elif min(l, r) > PINNED_CLEAR_MM:
+            pinned_since = None
+        pinned = pinned_since is not None and time.ticks_diff(time.ticks_ms(), pinned_since) > PINNED_MS
+        # going nowhere: the front reading should keep changing while we drive forwards
+        if front_ref is None or abs(f - front_ref) > NOT_MOVING_MM:
+            front_ref = f
+            front_ref_time = time.ticks_ms()
+        # (only if a side is also close, so a steady bad front reading in an open corridor can't set it off)
+        not_moving = f < 300 and min(l, r) < 60 and time.ticks_diff(time.ticks_ms(), front_ref_time) > NOT_MOVING_MS
+        if pinned or not_moving:
+            stop()
+            time.sleep_ms(80)
+            if l < r:
+                away = -1      # left side on the wall: turn right
+            else:
+                away = 1       # right side on the wall: turn left
+            b0 = (left_wheel.ticks + right_wheel.ticks) // 2
+            left_speed.reset()
+            right_speed.reset()
+            t0 = time.ticks_ms()
+            while (left_wheel.ticks + right_wheel.ticks) // 2 - b0 < BACK_OFF_MM * TICKS_PER_MM:
+                if time.ticks_diff(time.ticks_ms(), t0) > 1500:
+                    break
+                left_speed.drive(-TURN_SPEED)
+                right_speed.drive(-TURN_SPEED)
+            stop()
+            time.sleep_ms(80)
+            reversed_ticks = (left_wheel.ticks + right_wheel.ticks) // 2 - b0
+            spin(away * sign, BACK_OFF_TURN, 800)
+            back_offs += 1
+            trace.append("BACKED OFF %d at %d ms: %s (front %d left %d right %d), reversed and turned %s" % (
+                back_offs, time.ticks_diff(time.ticks_ms(), start),
+                "pinned on a side" if pinned else "front not changing, not moving",
+                f, l, r, "right" if away < 0 else "left"))
+            pinned_since = None
+            front_ref = None
+            last_mode, last_err, smooth_err, rate = None, None, None, 0
+            left_speed.reset()
+            right_speed.reset()
+            last_time = loop_time = time.ticks_ms()
+            last_moving = last_time
+            # the reverse + spin added ticks that weren't forward driving, and we're now further
+            # back by the reverse, so shift where the gap / turn point / last turn are
+            moved_extra = (left_wheel.ticks + right_wheel.ticks) // 2 - b0 + reversed_ticks
+            last_turn_ticks += moved_extra
+            if gap_start is not None:
+                gap_start += moved_extra
+            if turn_at_ticks is not None:
+                turn_at_ticks += moved_extra
+            continue
 
         # wall ahead: turn and carry on (2 close readings in a row, so one odd reading can't do it)
         close_count = close_count + 1 if wall_ahead_turn(f, l, r) else 0
@@ -476,6 +613,7 @@ def drive():
             result = turn(direction, sign)
             trace.append("TURN %d at %d ms: %s. %s" % (
                 turns, time.ticks_diff(time.ticks_ms(), start), why, result))
+            trace.append("STRAIGHTEN after wall turn: " + straighten())
             save_log(trace)               # so switching off mid-run doesn't lose everything
             close_count = 0
             open_left = open_right = None
@@ -486,11 +624,15 @@ def drive():
             right_speed.reset()
             last_time = loop_time = time.ticks_ms()
             last_moving = last_time
+            front_ref = None
             seen_left_wall = False
             left_gap_count = 0
             turn_at_ticks = None
             gap_start = None
             wall_count = 0
+            side_wall = centred
+            side_hist = []
+            turned_yet = True
             continue
 
         # ---- side openings (on the FOLLOW_SIDE) ----
@@ -500,43 +642,46 @@ def drive():
             side, other = r, l
         else:
             side, other = l, r
-        # where should this side's wall be? If we're off-centre the two sides add up to about
-        # 2 x centred, so close to this wall it reads short and an opening only reads a bit
-        # longer than normal (18 Nov: hugging the right wall, the first gap only read ~210 and
-        # got thrown away as too short). So the "open" line follows where the wall should be.
-        gap_line = centred * WALL_FACTOR
-        if other < centred * WALL_FACTOR:
-            expected = 2 * centred - other
-            gap_line = expected * WALL_FACTOR
-            if gap_line < 130:
-                gap_line = 130
-            if gap_line > 260:
-                gap_line = 260
+        # Gap = the side reading well above what this wall has been reading (side_wall is a
+        # running average of the wall). A fixed number didn't work in every maze (gaps read
+        # 240-260 in one maze, 175-225 in another).
+        gap_line = side_wall + GAP_JUMP_MM
+        if gap_line < 140:
+            gap_line = 140
+        if side < 9000:                       # 9999 = no reading, skip it
+            side_hist.append(side > gap_line)
+            if len(side_hist) > GAP_WINDOW:
+                side_hist.pop(0)
+        n_open = 0
+        for o in side_hist:
+            if o:
+                n_open += 1
         if TAKE_SIDE_OPENINGS and turn_at_ticks is None:
             now_ms = time.ticks_diff(time.ticks_ms(), start)
-            if side < gap_line:
-                seen_left_wall = True
-                left_gap_count = 0
-                wall_count += 1
-                if gap_start is not None and wall_count >= OPEN_COUNT and \
-                        moved - gap_start < GAP_MIN_MM * TICKS_PER_MM:
+            if gap_start is None:
+                if n_open == 0 and side < 9000:
+                    side_wall += 0.2 * (side - side_wall)   # learn what the wall reads
+                    seen_left_wall = True
+                if seen_left_wall and n_open >= GAP_IN:
+                    gap_start = moved
+                    gap_after_turn = turned_yet and since_turn < GAP_AFTER_TURN_MM
+                    trace.append("GAP START on the %s at %d ms (wall was ~%d, now %d)" % (
+                        FOLLOW_SIDE, now_ms, side_wall, side))
+            elif n_open <= GAP_OUT:
+                if gap_after_turn and moved - gap_start < GAP_AFTER_TURN_MIN * TICKS_PER_MM:
+                    trace.append("ignored a %d mm gap right after a turn (old corridor)" % (
+                        (moved - gap_start) / TICKS_PER_MM))
+                elif moved - gap_start < GAP_MIN_MM * TICKS_PER_MM:
                     trace.append("ignored a %d mm gap (too short to be real)" % (
                         (moved - gap_start) / TICKS_PER_MM))
-                    gap_start = None
-                if gap_start is not None and wall_count >= OPEN_COUNT:
+                else:
                     # far corner of the gap: the middle is halfway between start and here
                     middle = (gap_start + moved) // 2
                     turn_at_ticks = middle + int(LOOK_AHEAD_MM * TICKS_PER_MM)
                     trace.append("GAP END at %d ms, gap was %d mm long, turning in %d mm" % (
                         now_ms, (moved - gap_start) / TICKS_PER_MM,
                         (turn_at_ticks - moved) / TICKS_PER_MM))
-                    gap_start = None
-            elif seen_left_wall:
-                wall_count = 0
-                left_gap_count += 1
-                if left_gap_count >= OPEN_COUNT and gap_start is None:
-                    gap_start = moved
-                    trace.append("GAP START on the %s at %d ms" % (FOLLOW_SIDE, now_ms))
+                gap_start = None
             if gap_start is not None and moved - gap_start > GAP_MAX_MM * TICKS_PER_MM:
                 # no far wall showed up: open area, so go from the start of the gap instead
                 turn_at_ticks = gap_start + int((LOOK_AHEAD_MM + 84) * TICKS_PER_MM)
@@ -553,6 +698,7 @@ def drive():
                 d = 1
             got = spin(d * sign, TURN_90_TICKS, 2000)
             side_turns += 1
+            trace.append("STRAIGHTEN after side turn: " + straighten())
             trace.append("SIDE TURN %d at %d ms: %s 90, %d ticks, front now %d" % (
                 side_turns, time.ticks_diff(time.ticks_ms(), start), FOLLOW_SIDE, got, distance("front")))
             save_log(trace)
@@ -565,11 +711,15 @@ def drive():
             right_speed.reset()
             last_time = loop_time = time.ticks_ms()
             last_moving = last_time
+            front_ref = None
             seen_left_wall = False
             left_gap_count = 0
             turn_at_ticks = None
             gap_start = None
             wall_count = 0
+            side_wall = centred
+            side_hist = []
+            turned_yet = True
             continue
 
         now = time.ticks_ms()
@@ -616,6 +766,8 @@ def drive():
         speed = TARGET_SPEED
         if since_turn < AFTER_TURN_MM:
             speed = TARGET_SPEED * AFTER_TURN_SPEED   # slow just after a turn
+        if gap_start is not None or turn_at_ticks is not None:
+            speed = TARGET_SPEED * GAP_SPEED          # slow while lining up for a side turn
         left_speed.drive(speed * (1 - steer))
         right_speed.drive(speed * (1 + steer))
 
@@ -642,9 +794,8 @@ def drive():
     log("Power at the end: left %.2f  right %.2f  (use these as START_POWER_LEFT/RIGHT)"
         % (left_speed.power, right_speed.power))
     log("Centred side reading at the end: %d mm" % centred)
-    log("Trace (ms front left right off-centre rate steer powerL powerR), and turns:")
-    for t in trace:
-        log(t)
+    log("(trace lines above: ms front left right off-centre rate steer powerL powerR;")
+    log(" lines starting R = every raw reading: ms front left right)")
 
 
 # ---------------- run ----------------
@@ -656,11 +807,21 @@ def usb_plugged_in():
 
 
 def keep_previous_log():
-    # the run before this one is kept as prev_run.txt (plugging in USB starts a new run)
+    # Keep every run: the last run's log (last_run.txt) is renamed to run_1.txt, run_2.txt, ...
+    # (next free number, up to 20) so several runs in a row don't overwrite each other.
+    # The newest run is always last_run.txt. Plugging in USB doesn't start a run.
     import os
     try:
-        if "last_run.txt" in os.listdir():
-            os.rename("last_run.txt", "prev_run.txt")
+        files = os.listdir()
+        if "last_run.txt" in files:
+            n = 1
+            while ("run_%d.txt" % n) in files and n < 20:
+                n += 1
+            os.rename("last_run.txt", "run_%d.txt" % n)
+    except Exception:
+        pass
+    try:
+        os.remove("last_run.txt")   # the log is added to now, so make sure we start empty
     except Exception:
         pass
 
